@@ -28,6 +28,7 @@ import (
 
 	"github.com/FusionFoundation/go-fusion/common"
 	"github.com/FusionFoundation/go-fusion/consensus"
+	"github.com/FusionFoundation/go-fusion/consensus/datong"
 	"github.com/FusionFoundation/go-fusion/core"
 	"github.com/FusionFoundation/go-fusion/core/forkid"
 	"github.com/FusionFoundation/go-fusion/core/types"
@@ -144,6 +145,10 @@ func NewProtocolManager(config *params.ChainConfig, checkpoint *params.TrustedCh
 	if checkpoint != nil {
 		manager.checkpointNumber = (checkpoint.SectionIndex+1)*params.CHTFrequency - 1
 		manager.checkpointHash = checkpoint.SectionHead
+	}
+	if datong.LastCheckPoint > manager.checkpointNumber {
+		manager.checkpointNumber = datong.LastCheckPoint
+		manager.checkpointHash = datong.CheckPoints[datong.LastCheckPoint]
 	}
 
 	// Construct the downloader (long sync) and its backing state bloom if fast

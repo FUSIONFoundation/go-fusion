@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	mrand "math/rand"
 	"sort"
@@ -290,6 +291,7 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 			log.Warn("Truncate ancient chain", "from", previous, "to", low)
 		}
 	}
+	var minRewindHeight uint64 = math.MaxUint64
 	// Check the current state of the block hashes and make sure that we do not have any of the bad blocks in our chain
 	for hash := range BadHashes {
 		if header := bc.GetHeaderByHash(hash); header != nil {
@@ -298,9 +300,30 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 			// make sure the headerByNumber (if present) is in our current canonical chain
 			if headerByNumber != nil && headerByNumber.Hash() == header.Hash() {
 				log.Error("Found bad hash, rewinding chain", "number", header.Number, "hash", header.ParentHash)
-				bc.SetHead(header.Number.Uint64() - 1)
-				log.Error("Chain rewind was successful, resuming normal operation")
+				if header.Number.Uint64()-1 < minRewindHeight {
+					minRewindHeight = header.Number.Uint64() - 1
+				}
 			}
+		}
+	}
+	// check points, make sure that we do not have any mismatch block in our chain
+	for height, hash := range datong.CheckPoints {
+		headerByNumber := bc.GetHeaderByNumber(height)
+		if headerByNumber != nil && headerByNumber.Hash() != hash {
+			log.Error("check point mismatch", "number", height, "hash", headerByNumber.Hash(), "want", hash)
+			if height-1 < minRewindHeight {
+				minRewindHeight = height - 1
+			}
+		}
+	}
+	if ResyncFromHeight > 0 && ResyncFromHeight < minRewindHeight {
+		log.Warn("resync from height", "height", ResyncFromHeight)
+		minRewindHeight = ResyncFromHeight
+	}
+	if minRewindHeight != math.MaxUint64 {
+		if bc.GetHeaderByNumber(minRewindHeight) != nil {
+			bc.SetHead(minRewindHeight)
+			log.Error("Chain rewind was successful, resuming normal operation")
 		}
 	}
 	// Take ownership of this particular state
@@ -348,14 +371,6 @@ func (bc *BlockChain) loadLastState() error {
 		log.Warn("Head block missing, resetting chain", "hash", head)
 		return bc.Reset()
 	}
-	if ResyncFromHeight > 0 && currentBlock.NumberU64() > ResyncFromHeight {
-		resyncBlock := bc.GetBlockByNumber(ResyncFromHeight)
-		if resyncBlock != nil {
-			currentBlock = resyncBlock
-		} else {
-			log.Warn("can not resync from height %v", ResyncFromHeight)
-		}
-	}
 	// Make sure the state associated with the block is available
 	if _, err := state.New(currentBlock.Root(), currentBlock.MixDigest(), bc.stateCache); err != nil {
 		// Dangling block without a state associated, init from scratch
@@ -388,6 +403,7 @@ func (bc *BlockChain) loadLastState() error {
 			headFastBlockGauge.Update(int64(block.NumberU64()))
 		}
 	}
+
 	// Issue a status log for the user
 	currentFastBlock := bc.CurrentFastBlock()
 
@@ -419,7 +435,7 @@ func (bc *BlockChain) SetHead(head uint64) error {
 			if newHeadBlock == nil {
 				newHeadBlock = bc.genesisBlock
 			} else {
-				if _, err := state.New(newHeadBlock.Root(), newHeadBlock.MixDigest(), bc.stateCache); err != nil {
+				if err := bc.repair(&newHeadBlock); err != nil {
 					// Rewound state missing, rolled back to before pivot, reset to genesis
 					newHeadBlock = bc.genesisBlock
 				}
@@ -646,6 +662,10 @@ func (bc *BlockChain) ExportN(w io.Writer, first uint64, last uint64) error {
 //
 // Note, this function assumes that the `mu` mutex is held!
 func (bc *BlockChain) writeHeadBlock(block *types.Block) {
+	if _, err := datong.CheckPoint(bc.chainConfig.ChainID, block.NumberU64(), block.Hash()); err != nil {
+		log.Warn("forbid write head block", "err", err)
+		return
+	}
 	// If the block is on a side chain or an unknown one, force other heads onto it too
 	updateHeads := rawdb.ReadCanonicalHash(bc.db, block.NumberU64()) != block.Hash()
 
@@ -1543,6 +1563,9 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 	if atomic.LoadInt32(&bc.procInterrupt) == 1 {
 		return 0, nil
 	}
+	if i, err := datong.CheckPointsInBlockChain(bc.chainConfig.ChainID, chain); err != nil {
+		return i, err
+	}
 	// Start a parallel signature recovery (signer will fluke on fork transition, minimal perf loss)
 	senderCacher.recoverFromBlocks(types.MakeSigner(bc.chainConfig, chain[0].Number()), chain)
 
@@ -2051,6 +2074,9 @@ func (bc *BlockChain) reorg(oldBlock, newBlock *types.Block) error {
 		if newBlock == nil {
 			return fmt.Errorf("invalid new chain")
 		}
+	}
+	if _, err := datong.CheckPointsInBlockChain(bc.chainConfig.ChainID, newChain); err != nil {
+		return err
 	}
 	// Ensure the user sees large reorgs
 	if len(oldChain) > 0 && len(newChain) > 0 {
